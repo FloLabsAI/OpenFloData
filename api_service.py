@@ -121,10 +121,13 @@ async def root():
         "description": "Real-time production data from Volve field simulation",
         "endpoints": {
             "GET /wells": "List all wells",
-            "GET /wells/{well_name}/latest": "Get latest data for a specific well",
-            "GET /wells/{well_name}/history": "Get historical data for a specific well",
+            "GET /wells/latest": "Get latest data for a specific well",
+            "GET /wells/history": "Get historical data for a specific well",
             "GET /production/current": "Get current production for all wells",
             "GET /production/timeseries": "Get time-series production data",
+            "GET /surveillance/decline-analysis": "Arps decline curve analysis",
+            "GET /surveillance/productivity-index": "Well productivity index (PI) calculation",
+            "GET /stats": "Database statistics",
             "GET /health": "Health check",
         },
     }
@@ -396,8 +399,8 @@ async def get_production_timeseries(
                     SUM(oil_rate) as total_oil_rate,
                     SUM(gas_rate) as total_gas_rate,
                     SUM(water_rate) as total_water_rate,
-                    AVG(gor) as avg_gor,
-                    AVG(watercut) as avg_watercut,
+                    SUM(gas_rate) / NULLIF(SUM(oil_rate), 0) as avg_gor,
+                    SUM(water_rate) / NULLIF(SUM(oil_rate) + SUM(water_rate), 0) as avg_watercut,
                     COUNT(DISTINCT well_name) as well_count
                 FROM production_data
                 {where_clause}
@@ -503,6 +506,308 @@ async def get_database_stats():
         logger.error(f"Error fetching database stats: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
 
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/surveillance/decline-analysis")
+async def get_decline_analysis(
+    well_name: str = Query(..., description="Well name (e.g., F-14)"),
+    hours: int = Query(720, ge=24, le=8760, description="Hours of data to analyze (default 30 days)"),
+    rate_type: str = Query("oil", description="Rate type to analyze: oil, gas, or liquid"),
+):
+    """
+    Perform decline curve analysis for a well using Arps exponential model.
+
+    Returns:
+    - qi: Initial rate (at start of analysis period)
+    - Di: Nominal decline rate (per day)
+    - Di_annual: Annualized decline rate (fraction/year)
+    - b_factor: Arps b-factor (0 = exponential, 0-1 = hyperbolic, 1 = harmonic)
+    - eur_remaining: Estimated remaining recoverable volume (at current decline)
+    - r_squared: Goodness of fit (1.0 = perfect fit)
+    """
+    import numpy as np
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        # Validate rate_type
+        rate_column_map = {
+            "oil": "oil_rate",
+            "gas": "gas_rate",
+            "liquid": "liquid_rate",
+        }
+        if rate_type not in rate_column_map:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid rate_type. Must be one of: {list(rate_column_map.keys())}"
+            )
+        rate_column = rate_column_map[rate_type]
+
+        # Fetch daily-averaged production data for the well
+        query = f"""
+            WITH latest_time AS (
+                SELECT MAX(time) as max_time FROM production_data WHERE well_name = %s
+            )
+            SELECT
+                time_bucket('1d', time) AS time,
+                AVG({rate_column}) as rate,
+                AVG(on_stream_hrs) as on_stream_hrs
+            FROM production_data, latest_time
+            WHERE well_name = %s
+              AND time <= latest_time.max_time
+              AND time >= latest_time.max_time - INTERVAL '%s hours'
+              AND {rate_column} > 0
+            GROUP BY time_bucket('1d', time)
+            ORDER BY time ASC
+        """
+        cursor.execute(query, (well_name, well_name, hours))
+        results = cursor.fetchall()
+
+        if len(results) < 7:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Insufficient data for decline analysis. Need at least 7 data points, got {len(results)}"
+            )
+
+        # Extract time and rate arrays
+        times = []
+        rates = []
+        for i, row in enumerate(results):
+            times.append(i)  # Days from start
+            rates.append(float(row["rate"]) if row["rate"] else 0)
+
+        times = np.array(times)
+        rates = np.array(rates)
+
+        # Filter out zero rates for log calculation
+        valid_mask = rates > 0
+        if np.sum(valid_mask) < 7:
+            raise HTTPException(
+                status_code=400,
+                detail="Insufficient non-zero rate data for decline analysis"
+            )
+
+        t_valid = times[valid_mask]
+        q_valid = rates[valid_mask]
+        ln_q = np.log(q_valid)
+
+        # Linear regression: ln(q) = ln(qi) - Di * t
+        n = len(t_valid)
+        sum_t = np.sum(t_valid)
+        sum_ln_q = np.sum(ln_q)
+        sum_t_sq = np.sum(t_valid ** 2)
+        sum_t_ln_q = np.sum(t_valid * ln_q)
+
+        # Calculate slope (negative of Di) and intercept (ln(qi))
+        denominator = n * sum_t_sq - sum_t ** 2
+        if denominator == 0:
+            raise HTTPException(status_code=400, detail="Cannot compute decline - constant time values")
+
+        slope = (n * sum_t_ln_q - sum_t * sum_ln_q) / denominator
+        intercept = (sum_ln_q - slope * sum_t) / n
+
+        # Extract Arps parameters
+        qi = np.exp(intercept)  # Initial rate
+        Di = -slope  # Daily decline rate (positive value)
+        Di_annual = Di * 365  # Annualized decline rate
+
+        # Calculate R-squared
+        ln_q_pred = intercept + slope * t_valid
+        ss_res = np.sum((ln_q - ln_q_pred) ** 2)
+        ss_tot = np.sum((ln_q - np.mean(ln_q)) ** 2)
+        r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+
+        # Calculate EUR (remaining recoverable at current decline)
+        # For exponential decline: EUR = qi / Di (from current rate to zero)
+        current_rate = q_valid[-1]
+        if Di > 0:
+            eur_remaining = current_rate / Di  # Volume remaining
+        else:
+            eur_remaining = None  # No decline or increasing
+
+        # Get cumulative production in analysis period
+        cum_prod = np.sum(q_valid)  # Simple sum of daily rates
+
+        return clean_nan_values({
+            "well_name": well_name,
+            "analysis_period_hours": hours,
+            "rate_type": rate_type,
+            "data_points": len(results),
+            "valid_points": int(np.sum(valid_mask)),
+            "decline_parameters": {
+                "qi": round(float(qi), 2),
+                "qi_unit": f"{rate_type}_rate/day",
+                "Di_daily": round(float(Di), 6),
+                "Di_annual": round(float(Di_annual), 4),
+                "Di_annual_percent": round(float(Di_annual * 100), 2),
+                "b_factor": 0,  # Exponential model assumes b=0
+                "model_type": "exponential",
+            },
+            "production_summary": {
+                "initial_rate": round(float(q_valid[0]), 2),
+                "current_rate": round(float(current_rate), 2),
+                "rate_change_percent": round(float((current_rate - q_valid[0]) / q_valid[0] * 100), 2) if q_valid[0] > 0 else None,
+                "cumulative_in_period": round(float(cum_prod), 2),
+            },
+            "forecast": {
+                "eur_remaining": round(float(eur_remaining), 2) if eur_remaining else None,
+                "eur_unit": f"{rate_type}_volume",
+            },
+            "goodness_of_fit": {
+                "r_squared": round(float(r_squared), 4),
+                "fit_quality": "excellent" if r_squared > 0.9 else "good" if r_squared > 0.7 else "fair" if r_squared > 0.5 else "poor",
+            },
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error performing decline analysis for well '{well_name}': {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/surveillance/productivity-index")
+async def get_productivity_index(
+    well_name: str = Query(..., description="Well name (e.g., F-14)"),
+    hours: int = Query(168, ge=1, le=720, description="Hours of data to analyze (default 7 days)"),
+    reservoir_pressure: float = Query(None, description="Static reservoir pressure (psi). If not provided, uses max BHP."),
+):
+    """
+    Calculate well Productivity Index (PI) from flowing bottomhole pressure and rates.
+
+    PI = q / (Pr - Pwf)
+
+    Where:
+    - q: Production rate
+    - Pr: Static reservoir pressure
+    - Pwf: Flowing bottomhole pressure
+
+    Returns PI for oil, liquid, and injectivity index for injectors.
+    """
+    import numpy as np
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        # Fetch production and pressure data
+        query = """
+            WITH latest_time AS (
+                SELECT MAX(time) as max_time FROM production_data WHERE well_name = %s
+            )
+            SELECT
+                time,
+                well_type,
+                oil_rate,
+                liquid_rate,
+                water_inj_rate,
+                downhole_pressure,
+                choke_size
+            FROM production_data, latest_time
+            WHERE well_name = %s
+              AND time <= latest_time.max_time
+              AND time >= latest_time.max_time - INTERVAL '%s hours'
+              AND downhole_pressure IS NOT NULL
+              AND downhole_pressure > 0
+            ORDER BY time ASC
+        """
+        cursor.execute(query, (well_name, well_name, hours))
+        results = cursor.fetchall()
+
+        if len(results) < 3:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Insufficient pressure data for PI calculation. Need at least 3 points with BHP, got {len(results)}"
+            )
+
+        # Extract data
+        well_type = results[0]["well_type"]
+        bhps = np.array([float(r["downhole_pressure"]) for r in results if r["downhole_pressure"]])
+
+        if well_type == "OP":  # Producer
+            rates = np.array([float(r["oil_rate"] or 0) for r in results])
+            liquid_rates = np.array([float(r["liquid_rate"] or 0) for r in results])
+        else:  # Injector
+            rates = np.array([float(r["water_inj_rate"] or 0) for r in results])
+            liquid_rates = rates
+
+        # Estimate reservoir pressure if not provided
+        if reservoir_pressure is None:
+            # Use maximum BHP as proxy for reservoir pressure (shut-in approximation)
+            pr = float(np.max(bhps))
+        else:
+            pr = reservoir_pressure
+
+        # Calculate drawdown and PI for each point
+        drawdowns = pr - bhps
+        valid_mask = (drawdowns > 0) & (rates > 0)
+
+        if np.sum(valid_mask) < 2:
+            raise HTTPException(
+                status_code=400,
+                detail="Insufficient valid drawdown data (need positive drawdown and rates)"
+            )
+
+        # Calculate PI = q / (Pr - Pwf)
+        pi_values = rates[valid_mask] / drawdowns[valid_mask]
+        pi_liquid_values = liquid_rates[valid_mask] / drawdowns[valid_mask]
+
+        # Statistics
+        avg_pi = float(np.mean(pi_values))
+        avg_pi_liquid = float(np.mean(pi_liquid_values))
+        std_pi = float(np.std(pi_values))
+
+        # Specific PI (normalized by net pay if available - using 1 as placeholder)
+        # In real applications, this would come from well completion data
+
+        # Calculate AOF (Absolute Open Flow) - theoretical max rate at Pwf=0
+        aof = avg_pi * pr
+
+        return clean_nan_values({
+            "well_name": well_name,
+            "well_type": well_type,
+            "analysis_period_hours": hours,
+            "data_points": len(results),
+            "valid_points": int(np.sum(valid_mask)),
+            "pressure_data": {
+                "reservoir_pressure_psi": round(pr, 2),
+                "reservoir_pressure_source": "provided" if reservoir_pressure else "estimated_from_max_bhp",
+                "avg_flowing_bhp_psi": round(float(np.mean(bhps)), 2),
+                "min_flowing_bhp_psi": round(float(np.min(bhps)), 2),
+                "max_flowing_bhp_psi": round(float(np.max(bhps)), 2),
+                "avg_drawdown_psi": round(float(np.mean(drawdowns[valid_mask])), 2),
+            },
+            "productivity_index": {
+                "pi_oil": round(avg_pi, 4) if well_type == "OP" else None,
+                "pi_liquid": round(avg_pi_liquid, 4) if well_type == "OP" else None,
+                "injectivity_index": round(avg_pi, 4) if well_type == "WI" else None,
+                "pi_unit": "bbl/d/psi" if well_type == "OP" else "bbl/d/psi",
+                "pi_std_dev": round(std_pi, 4),
+                "pi_coefficient_of_variation": round(std_pi / avg_pi * 100, 2) if avg_pi > 0 else None,
+            },
+            "deliverability": {
+                "aof_rate": round(aof, 2),
+                "aof_unit": "bbl/d",
+                "aof_description": "Theoretical maximum rate at zero flowing BHP",
+            },
+            "interpretation": {
+                "pi_quality": "excellent" if avg_pi > 10 else "good" if avg_pi > 5 else "fair" if avg_pi > 1 else "poor",
+                "consistency": "stable" if (std_pi / avg_pi < 0.2 if avg_pi > 0 else False) else "variable",
+            },
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error calculating PI for well '{well_name}': {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
     finally:
         cursor.close()
         conn.close()

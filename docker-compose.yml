@@ -5,16 +5,16 @@ services:
     image: postgres:16-alpine
     container_name: flodata-postgres
     environment:
-      POSTGRES_USER: flodata
-      POSTGRES_PASSWORD: flodata_secret
-      POSTGRES_DB: volve_production
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./scripts/sql/init-postgres-timebucket.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U flodata"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -27,36 +27,17 @@ services:
       dockerfile: Dockerfile
     container_name: flodata-streamer
     environment:
-      # Database connection
-      DB_HOST: postgres
-      DB_PORT: 5432
-      DB_NAME: volve_production
-      DB_USER: flodata
-      DB_PASSWORD: flodata_secret
-
-      # Streaming configuration (Clock-Synchronized Real-Time)
-      # Streaming is always synchronized to real-world clock: 1 hour per hour
-
-      # START_OFFSET_DAYS: Maps "today 00:00" to N days from first date in source data
-      #   How it works:
-      #     - Source data starts at 2007-09-01 (day 0)
-      #     - Day 0 + offset days = the day that maps to today
-      #     - All hours are synchronized: source hour X → today hour X
-      #   Examples:
-      #     0 = 2007-09-01 maps to today (batch loads all history, streams from beginning)
-      #     365 = 2008-08-31 maps to today (batch loads 365 days, streams from day 365+)
-      START_OFFSET_DAYS: 365
-
-      # BATCH_SIZE_HOURS: Hours per batch during initial historical data loading
-      #   Larger = faster initial load but more memory
-      #   168 hours = 7 days per batch (good balance)
-      BATCH_SIZE_HOURS: 168
-
-      # DuckDB source
-      DUCKDB_PATH: /app/data/prod_hourly_data.duckdb
-
-      # Timezone
-      TZ: Asia/Kuala_Lumpur
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      START_OFFSET_DAYS: ${START_OFFSET_DAYS}
+      BATCH_SIZE_HOURS: ${BATCH_SIZE_HOURS}
+      CATCHUP_THRESHOLD_HOURS: ${CATCHUP_THRESHOLD_HOURS}
+      CATCHUP_BATCH_HOURS: ${CATCHUP_BATCH_HOURS}
+      DUCKDB_PATH: ${DUCKDB_PATH}
+      TZ: ${TZ}
     volumes:
       - ./data:/app/data:ro
     depends_on:
@@ -72,12 +53,12 @@ services:
       dockerfile: Dockerfile.api
     container_name: flodata-api
     environment:
-      DB_HOST: postgres
-      DB_PORT: 5432
-      DB_NAME: volve_production
-      DB_USER: flodata
-      DB_PASSWORD: flodata_secret
-      TZ: Asia/Kuala_Lumpur
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      TZ: ${TZ}
     ports:
       - "8000:8000"
     depends_on:
