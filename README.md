@@ -713,7 +713,6 @@ Contributions are welcome! Please feel free to submit issues, feature requests, 
 ### Questions or Issues?
 
 - **Issues**: https://github.com/FloLabsAI/OpenFloData/issues
-- **Discussions**: https://github.com/FloLabsAI/OpenFloData/discussions
 
 ---
 
