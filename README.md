@@ -192,6 +192,23 @@ http://localhost:8000
 - **Swagger UI**: http://localhost:8000/docs
 - **ReDoc**: http://localhost:8000/redoc
 
+#### Units Convention
+
+All API responses use **oilfield units** consistent with the source Volve dataset:
+
+| Parameter | Unit | Notes |
+|-----------|------|-------|
+| Oil rate | bbl/d | Stock tank barrels per day |
+| Gas rate | Sm³/d | Standard cubic meters per day |
+| Water rate | bbl/d | Stock tank barrels per day |
+| Pressure | bar | 1 bar ≈ 14.5 psi |
+| Temperature | °C | Degrees Celsius |
+| GOR | Sm³/Sm³ | Standard cubic meters gas per cubic meter oil |
+| Choke size | mm | Choke bean diameter |
+| PI | bbl/d/psi | Productivity Index (converted internally) |
+
+> **Note**: The original Volve data uses metric units. Typical downhole pressure values range from 200-300 bar (2900-4350 psi).
+
 #### Endpoints
 
 **1. Health Check**
@@ -255,7 +272,7 @@ GET /wells/history?well_name={name}&hours={hours}&interval={interval}
 Parameters:
 - `well_name` (query, required): Well identifier (e.g., "F-14")
 - `hours` (query, optional): Number of hours to retrieve (default: 24, max: 720)
-- `interval` (query, optional): Time bucket interval (default: "1h", e.g., "1h", "6h", "1d")
+- `interval` (query, optional): Time bucket interval (default: "1h", options: "1h", "6h", "12h", "1d", "7d")
 
 Example:
 ```bash
@@ -270,7 +287,7 @@ GET /production/current
 Parameters:
 - `well_type` (query, optional): Filter by well type (default: "OP")
 
-Returns current production snapshot for all wells.
+Returns current production snapshot for all wells including totals for oil rate, gas rate, water rate, field GOR, and watercut.
 
 **6. Get Production Timeseries**
 ```bash
@@ -279,7 +296,7 @@ GET /production/timeseries?hours={hours}&interval={interval}
 
 Parameters:
 - `hours` (query, optional): Number of hours to retrieve (default: 24, max: 720)
-- `interval` (query, optional): Time bucket interval (default: "1h")
+- `interval` (query, optional): Time bucket interval (default: "1h", options: "1h", "6h", "12h", "1d")
 - `well_type` (query, optional): Filter by well type (default: "OP")
 - `aggregate` (query, optional): Aggregate all wells into single timeseries (default: true)
 
@@ -288,7 +305,95 @@ Parameters:
 GET /stats
 ```
 
-Returns database statistics and system info.
+Returns database statistics including total records, well count, and time range of available data.
+
+**8. Decline Curve Analysis**
+```bash
+GET /surveillance/decline-analysis?well_name={name}&hours={hours}&rate_type={type}
+```
+
+Performs **Arps exponential decline curve analysis** to estimate decline parameters and remaining reserves.
+
+Parameters:
+- `well_name` (query, required): Well identifier (e.g., "F-14")
+- `hours` (query, optional): Analysis period in hours (default: 720 / 30 days, max: 8760 / 1 year)
+- `rate_type` (query, optional): Rate to analyze - `oil`, `gas`, or `liquid` (default: "oil")
+
+Example:
+```bash
+curl "http://localhost:8000/surveillance/decline-analysis?well_name=F-14&hours=720&rate_type=oil"
+```
+
+Response includes:
+- `qi`: Initial rate at start of analysis period
+- `Di_daily`: Nominal decline rate (fraction/day)
+- `Di_annual`: Annualized decline rate (fraction/year)
+- `Di_annual_percent`: Decline rate as percentage
+- `b_factor`: Arps b-factor (always 0 for exponential model)
+- `eur_remaining`: Estimated remaining recoverable volume
+- `r_squared`: Goodness of fit (R²)
+
+**Model**: Uses Arps **exponential decline** (b-factor = 0):
+```
+q(t) = qi × exp(-Di × t)
+```
+
+> **Limitations**: Exponential decline assumes constant decline rate. Best suited for mature conventional wells in boundary-dominated flow. May underestimate reserves for unconventional wells which typically exhibit hyperbolic decline (b > 0). Requires minimum 7 valid data points.
+
+**9. Productivity Index (PI) Calculation**
+```bash
+GET /surveillance/productivity-index?well_name={name}&hours={hours}&reservoir_pressure={psi}
+```
+
+Calculates well **Productivity Index (PI)** from flowing bottomhole pressure (BHP) and production rates.
+
+Parameters:
+- `well_name` (query, required): Well identifier (e.g., "F-14")
+- `hours` (query, optional): Analysis period in hours (default: 168 / 7 days, max: 720)
+- `reservoir_pressure` (query, optional): Static reservoir pressure in psi. If not provided, uses maximum observed BHP as proxy.
+
+Example:
+```bash
+curl "http://localhost:8000/surveillance/productivity-index?well_name=F-14&hours=168"
+```
+
+Response includes:
+- `pi_oil`: Productivity Index for oil (bbl/d/psi) - for producers
+- `pi_liquid`: Productivity Index for total liquid (bbl/d/psi) - for producers
+- `injectivity_index`: Injectivity Index (bbl/d/psi) - for injectors
+- `aof_rate`: Absolute Open Flow - theoretical maximum rate at zero BHP
+- `pressure_data`: Summary of reservoir pressure, flowing BHP, and drawdown
+
+**Calculation**: `PI = q / (Pr - Pwf)`
+
+Where:
+- `q` = Production rate
+- `Pr` = Static reservoir pressure
+- `Pwf` = Flowing bottomhole pressure
+
+> **Important**: If `reservoir_pressure` is not provided, the API uses maximum observed BHP as a proxy. This works best for wells with recent shut-in periods and low mechanical skin. For accurate PI calculations, provide measured static reservoir pressure from pressure buildup tests.
+
+---
+
+### Oilfield Terminology Glossary
+
+| Term | Definition |
+|------|------------|
+| **BHP** | Bottomhole Pressure - pressure measured at the producing formation depth |
+| **THP** | Tubing Head Pressure - pressure at the wellhead on the tubing side |
+| **GOR** | Gas-Oil Ratio - volume of gas produced per volume of oil |
+| **Watercut** | Fraction of produced liquid that is water (0-1) |
+| **PI** | Productivity Index - well deliverability measure (rate per unit drawdown) |
+| **Pwf** | Flowing bottomhole pressure - BHP during production |
+| **Pr** | Static reservoir pressure - formation pressure at rest |
+| **qi** | Initial production rate (Arps decline parameter) |
+| **Di** | Nominal decline rate (Arps parameter) |
+| **EUR** | Estimated Ultimate Recovery - total recoverable volume over well life |
+| **b-factor** | Arps decline exponent (0=exponential, 0<b<1=hyperbolic, 1=harmonic) |
+| **AOF** | Absolute Open Flow - theoretical max rate at zero flowing BHP |
+| **Drawdown** | Pressure difference between reservoir and wellbore (Pr - Pwf) |
+| **OP** | Oil Producer well type |
+| **WI** | Water Injector well type |
 
 ---
 
