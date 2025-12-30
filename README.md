@@ -128,14 +128,48 @@ SELECT COUNT(*) FROM production_data;
 -- Get latest records
 SELECT * FROM production_data ORDER BY time DESC LIMIT 10;
 
--- Production by well (last 24 hours)
+-- Last 24 hours summary: rates, GOR, watercut, and uptime
+-- (Production snapshot for surveillance dashboard)
 SELECT
     well_name,
-    COUNT(*) as records,
-    AVG(annulus_pressure) as avg_pressure
+    well_type,
+    ROUND(AVG(oil_rate)::numeric, 1) as avg_oil_bopd,
+    ROUND(AVG(gas_rate)::numeric, 1) as avg_gas_sm3d,
+    ROUND(AVG(watercut)::numeric, 2) as avg_watercut,
+    ROUND((SUM(gas_rate) / NULLIF(SUM(oil_rate), 0))::numeric, 0) as gor,
+    ROUND(SUM(on_stream_hrs)::numeric, 1) as on_stream_hrs,
+    COUNT(*) as data_points
 FROM production_data
 WHERE time > NOW() - INTERVAL '24 hours'
-GROUP BY well_name;
+GROUP BY well_name, well_type
+ORDER BY avg_oil_bopd DESC;
+
+-- Well deliverability trend: production rate vs pressure over time
+-- (Identifies productivity changes, skin damage, or reservoir depletion)
+SELECT
+    DATE_TRUNC('day', time) AS date,
+    well_name,
+    ROUND(AVG(oil_rate)::numeric, 0) AS avg_oil_bopd,
+    ROUND(AVG(downhole_pressure)::numeric, 1) AS avg_bhp_bar,
+    ROUND(AVG(thp)::numeric, 1) AS avg_thp_bar,
+    ROUND(AVG(choke_size)::numeric, 1) AS avg_choke_mm,
+    COUNT(*) as hours_with_data
+FROM production_data
+WHERE well_type = 'OP' AND time > NOW() - INTERVAL '7 days'
+GROUP BY DATE_TRUNC('day', time), well_name
+ORDER BY well_name, date;
+
+-- GOR trend: monitor reservoir drive behavior
+-- (Rising GOR may indicate depletion below bubble point, gas cap expansion, or gas coning)
+SELECT
+    well_name,
+    DATE_TRUNC('day', time) AS date,
+    ROUND((SUM(gas_rate) / NULLIF(SUM(oil_rate), 0))::numeric, 0) AS gor,
+    ROUND(AVG(oil_rate)::numeric, 0) AS avg_oil_bopd
+FROM production_data
+WHERE well_type = 'OP' AND time > NOW() - INTERVAL '14 days'
+GROUP BY well_name, DATE_TRUNC('day', time)
+ORDER BY well_name, date;
 
 -- Database size
 SELECT pg_size_pretty(pg_database_size('volve_production'));
@@ -164,21 +198,65 @@ uv add pandas sqlalchemy psycopg2-binary
 import pandas as pd
 from sqlalchemy import create_engine
 
-# Create engine
+# Create database connection
 engine = create_engine("postgresql://flodata:flodata_secret@localhost:5432/volve_production")
 
-# Read data into a DataFrame
+# Load last 7 days of production data
 df = pd.read_sql("""
-    SELECT time, well_name, downhole_pressure, downhole_temperature,
-           choke_size, on_stream_hrs
+    SELECT time, well_name, well_type, oil_rate, gas_rate, water_rate,
+           watercut, gor, downhole_pressure, thp, choke_size, on_stream_hrs
     FROM production_data
     WHERE time > NOW() - INTERVAL '7 days'
     ORDER BY time
 """, engine)
 
-# Analyze with pandas
-print(df.describe())
-print(df.groupby('well_name').mean(numeric_only=True))
+df['time'] = pd.to_datetime(df['time'])
+df['date'] = df['time'].dt.date
+```
+
+**Production surveillance examples:**
+
+```python
+# Last 24 hours summary by well
+# Note: GOR calculated from summed volumes, not averaged ratios
+last_24h = df[df['time'] > df['time'].max() - pd.Timedelta(hours=24)]
+summary = last_24h.groupby(['well_name', 'well_type']).agg(
+    avg_oil_bopd=('oil_rate', 'mean'),
+    avg_gas_sm3d=('gas_rate', 'mean'),
+    avg_watercut=('watercut', 'mean'),
+    total_oil=('oil_rate', 'sum'),
+    total_gas=('gas_rate', 'sum'),
+    on_stream_hrs=('on_stream_hrs', 'sum'),
+    data_points=('oil_rate', 'count')
+).round(1)
+summary['gor'] = (summary['total_gas'] / summary['total_oil']).round(0)
+print(summary[['avg_oil_bopd', 'avg_gas_sm3d', 'gor', 'avg_watercut', 'on_stream_hrs']])
+```
+
+```python
+# Well deliverability trend: daily rate vs pressure
+# (Identifies productivity changes, skin damage, or depletion)
+producers = df[df['well_type'] == 'OP']
+deliverability = producers.groupby(['well_name', 'date']).agg(
+    avg_oil_bopd=('oil_rate', 'mean'),
+    avg_bhp_bar=('downhole_pressure', 'mean'),
+    avg_thp_bar=('thp', 'mean'),
+    avg_choke_mm=('choke_size', 'mean'),
+    hours_with_data=('oil_rate', 'count')
+).round(1)
+print(deliverability)
+```
+
+```python
+# GOR trend: monitor reservoir drive behavior
+# (Rising GOR may indicate depletion below bubble point, gas cap expansion, or gas coning)
+gor_trend = producers.groupby(['well_name', 'date']).agg(
+    total_gas=('gas_rate', 'sum'),
+    total_oil=('oil_rate', 'sum'),
+    avg_oil_bopd=('oil_rate', 'mean')
+).round(1)
+gor_trend['gor'] = (gor_trend['total_gas'] / gor_trend['total_oil']).round(0)
+print(gor_trend[['gor', 'avg_oil_bopd']])
 ```
 
 ### API Reference
@@ -372,28 +450,6 @@ Where:
 - `Pwf` = Flowing bottomhole pressure
 
 > **Important**: If `reservoir_pressure` is not provided, the API uses maximum observed BHP as a proxy. This works best for wells with recent shut-in periods and low mechanical skin. For accurate PI calculations, provide measured static reservoir pressure from pressure buildup tests.
-
----
-
-### Oilfield Terminology Glossary
-
-| Term | Definition |
-|------|------------|
-| **BHP** | Bottomhole Pressure - pressure measured at the producing formation depth |
-| **THP** | Tubing Head Pressure - pressure at the wellhead on the tubing side |
-| **GOR** | Gas-Oil Ratio - volume of gas produced per volume of oil |
-| **Watercut** | Fraction of produced liquid that is water (0-1) |
-| **PI** | Productivity Index - well deliverability measure (rate per unit drawdown) |
-| **Pwf** | Flowing bottomhole pressure - BHP during production |
-| **Pr** | Static reservoir pressure - formation pressure at rest |
-| **qi** | Initial production rate (Arps decline parameter) |
-| **Di** | Nominal decline rate (Arps parameter) |
-| **EUR** | Estimated Ultimate Recovery - total recoverable volume over well life |
-| **b-factor** | Arps decline exponent (0=exponential, 0<b<1=hyperbolic, 1=harmonic) |
-| **AOF** | Absolute Open Flow - theoretical max rate at zero flowing BHP |
-| **Drawdown** | Pressure difference between reservoir and wellbore (Pr - Pwf) |
-| **OP** | Oil Producer well type |
-| **WI** | Water Injector well type |
 
 ---
 
